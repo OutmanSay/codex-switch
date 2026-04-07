@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# codex-switch — ChatGPT Plus 多账号切换工具
+# Usage:
+#   codex-switch              # 显示当前 + 可用账号列表
+#   codex-switch <name>       # 切到指定账号（自动同步当前账号存档）
+#   codex-switch save <name>  # 手动保存当前账号为 <name>
+
+set -e
+AUTH_DIR="$HOME/.codex"
+AUTH_CURRENT="$AUTH_DIR/auth.json"
+
+# 从 auth.json 读出当前邮箱（解析 id_token JWT）
+current_email() {
+    [[ ! -f "$AUTH_CURRENT" ]] && echo "" && return
+    python3 -c "
+import json, base64, sys
+try:
+    d = json.load(open('$AUTH_CURRENT'))
+    tok = d.get('tokens', {}).get('id_token', '')
+    if not tok: sys.exit(0)
+    p = tok.split('.')[1]
+    p += '=' * (4 - len(p) % 4)
+    data = json.loads(base64.urlsafe_b64decode(p))
+    email = data.get('email') or data.get('preferred_username') or data.get('sub', '')
+    print(email)
+except: pass
+" 2>/dev/null
+}
+
+# 从 auth.json 读出当前邮箱的本地部分（@ 前面）
+current_name() {
+    local email=$(current_email)
+    [[ -z "$email" ]] && echo "" && return
+    echo "${email%@*}"
+}
+
+show_current() {
+    if [[ ! -f "$AUTH_CURRENT" ]]; then
+        echo "当前未登录（无 auth.json）"
+        return
+    fi
+    local email=$(current_email)
+    local mode=$(python3 -c "import json; print(json.load(open('$AUTH_CURRENT')).get('auth_mode',''))" 2>/dev/null)
+    if [[ -n "$email" ]]; then
+        echo "当前账号: $email (mode: $mode)"
+    else
+        echo "当前账号: (无法解析)"
+    fi
+}
+
+list_accounts() {
+    local files=("$AUTH_DIR"/auth-*.json)
+    if [[ ! -e "${files[0]}" ]]; then
+        echo "(还没有保存任何账号存档。用 'codex-switch save <name>' 保存当前登录的账号)"
+        return
+    fi
+    echo "已保存的账号:"
+    for f in "${files[@]}"; do
+        local name=$(basename "$f" | sed 's|^auth-||;s|\.json$||')
+        local email=$(python3 -c "
+import json, base64
+try:
+    d = json.load(open('$f'))
+    tok = d.get('tokens', {}).get('id_token', '')
+    if tok:
+        p = tok.split('.')[1]; p += '=' * (4 - len(p) % 4)
+        print(json.loads(base64.urlsafe_b64decode(p)).get('email', '?'))
+    else: print('?')
+except: print('?')
+" 2>/dev/null)
+        printf "  %-20s  %s\n" "$name" "$email"
+    done
+}
+
+auto_sync_current() {
+    # 切换前：把当前 auth.json 同步回对应的存档文件（获取 refresh 后的最新 token）
+    local cur_name=$(current_name)
+    [[ -z "$cur_name" ]] && return
+    local archive="$AUTH_DIR/auth-$cur_name.json"
+    # 只在存档已经存在时同步（避免意外创建新存档）
+    if [[ -f "$archive" ]]; then
+        cp "$AUTH_CURRENT" "$archive"
+        echo "  (auto-sync: 当前账号 '$cur_name' 的最新 token 已同步回存档)"
+    fi
+}
+
+case "$1" in
+    "")
+        show_current
+        echo ""
+        list_accounts
+        ;;
+    save)
+        if [[ -z "$2" ]]; then
+            echo "用法: codex-switch save <name>"
+            exit 1
+        fi
+        if [[ ! -f "$AUTH_CURRENT" ]]; then
+            echo "错误: 没有当前登录（先跑 'codex login'）"
+            exit 1
+        fi
+        cp "$AUTH_CURRENT" "$AUTH_DIR/auth-$2.json"
+        echo "✓ 当前账号已保存为 '$2'"
+        show_current
+        ;;
+    *)
+        target="$AUTH_DIR/auth-$1.json"
+        if [[ ! -f "$target" ]]; then
+            echo "错误: 账号 '$1' 不存在"
+            echo ""
+            list_accounts
+            exit 1
+        fi
+        # 切换前自动同步当前账号的最新 token 回对应存档
+        auto_sync_current
+        cp "$target" "$AUTH_CURRENT"
+        echo "✓ 已切换到账号 '$1'"
+        show_current
+        ;;
+esac
