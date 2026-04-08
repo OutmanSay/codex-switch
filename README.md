@@ -1,9 +1,28 @@
 # codex-switch
 
-ChatGPT Plus 多账号管理工具，用 bash 实现 [OpenAI Codex CLI](https://github.com/openai/codex) 的账号切换。
+> 🧠 **AI Agent Skill** — Let your agent switch ChatGPT Plus accounts for you.
+> Works with [OpenClaw](https://github.com/openclaw/openclaw) · [Claude Code](https://claude.com/claude-code) · [Codex CLI](https://github.com/openai/codex) · and any agent runtime that can shell out.
+
+ChatGPT Plus 多账号管理工具，用 bash 实现 [OpenAI Codex CLI](https://github.com/openai/codex) 的账号切换 + **完整的 OpenClaw agent 双缓存同步**。
 
 > Codex CLI 本身只支持单账号（一份 OAuth token 存在 `~/.codex/auth.json`）。
 > 这个工具通过备份/替换 token 文件实现多账号轮换，适合有多个 ChatGPT Plus 账号想轮流用的场景。
+>
+> **v1.1.0 (2026-04-08)** 新增：同步到 OpenClaw 每个 agent 的独立 `auth-profiles.json` 缓存（避免"切了跟没切一样"的 bug），并支持 interactive terminal 下的 gateway 自动重启。
+
+## What's this?
+
+这是一个 **AI agent skill**：一个让 LLM 驱动的助手能通过自然语言调用的工具。
+
+对你的 agent 说 *"GPT-5.4 额度用完了，切到另一个账号"*，它就会自动调这个 skill，执行完整的账号切换流程（包括同步到 OpenClaw agent 缓存 + 杀运行中的 codex 进程 + 必要时重启 gateway），**单次对话完成**。
+
+**支持的 agent 运行时**：
+- [OpenClaw](https://github.com/openclaw/openclaw) —— 自托管多 agent 编排平台（一等公民支持）
+- [Claude Code](https://claude.com/claude-code) —— Anthropic 官方 CLI/IDE（可通过 bash tool 调用）
+- [Codex CLI](https://github.com/openai/codex) —— OpenAI 官方（即本工具服务的对象）
+- 任何能执行 shell 的 agent 框架（Cursor / Aider / Continue / Gemini CLI 等）
+
+**也能当普通 CLI 用**：不用 agent 的话直接在 terminal 里跑 `codex-switch alice` 也完全可以，功能一样。
 
 ## 为什么需要这个
 
@@ -127,20 +146,62 @@ $ codex-switch bob
 - 账号存档：`~/.codex/auth-<name>.json`
 - 灾难恢复备份：`~/.codex/auth.json.before-switch`（每次切换前自动创建）
 
-## 与 OpenClaw 集成
+## 与 OpenClaw 的深度集成（v1.1.0）
 
-如果你用 [OpenClaw](https://github.com/openclaw/openclaw) 通过 Codex CLI 调用 GPT-5.4，这个工具可以无缝接入。
+如果你用 [OpenClaw](https://github.com/openclaw/openclaw) 通过 Codex CLI 调用 GPT-5.4，这个工具是**一等公民**。
 
-仓库的 `openclaw-skill-example/SKILL.md` 包含一个完整的 OpenClaw skill 示例，让 AI agent 能听懂 "切换 codex 账号"、"GPT-5.4 额度用完了" 等自然语言指令，自动帮你切换账号。
+### 坑：OpenClaw 的双缓存 bug
 
-用法：
+OpenClaw 的 `openai-codex` provider **不直接读 `~/.codex/auth.json`**！它在每个 agent 的 `~/.openclaw/agents/<name>/agent/auth-profiles.json` 里**缓存了自己的一份 OAuth token**。
+
+这导致一个非常隐蔽的问题：你用 `codex-switch alice` 切到 alice 账号后，OpenClaw agent 下次调 gpt-5.4 时**依然会烧 bob 的额度**，因为它读的是自己的缓存副本。
+
+**v1.1.0 修复**：`codex-switch <name>` 现在会**自动同步到所有 OpenClaw agent 的 auth-profiles.json**，并在必要时重启 gateway。流程：
+
+1. `auto_sync_current` —— 存回当前账号的最新 token
+2. `kill_running_codex` —— 精确匹配杀掉运行中的 codex 进程（避免 rate limit 内存缓存陷阱）
+3. `cp auth-<target>.json → auth.json` —— 切换 Codex CLI 层
+4. **`sync_openclaw_profiles`** —— 把新 token 写入 5 个 agent 的 auth-profiles.json（原子写 + 自动备份）
+5. **`restart_openclaw_gateway`** —— 仅在 terminal 交互模式下执行（用 `[ -t 1 ]` 检测），sub-agent 场景依赖 gateway 热加载
+
+### 额外的 debug 命令
+
 ```bash
-# 安装 skill 到 OpenClaw
+# 强制重新同步（不切账号，只刷新 OpenClaw 的缓存）
+codex-switch sync-openclaw
+```
+
+用于怀疑 OpenClaw 缓存跟 `~/.codex/auth.json` 不一致时。
+
+### Agent 触发
+
+仓库的 `openclaw-skill-example/SKILL.md` 是完整的 OpenClaw skill 定义。安装后，让你的 agent 听懂：
+
+- "GPT-5.4 额度用完了"
+- "切换 codex 账号"
+- "换一个 ChatGPT Plus 账号"
+- "codex 欠费了 / 调不通了"
+- "用 alice 账号"
+
+安装：
+```bash
 mkdir -p ~/.openclaw/skills/codex-account-switch
 cp openclaw-skill-example/SKILL.md ~/.openclaw/skills/codex-account-switch/SKILL.md
 ```
 
-然后对话里说"切换 codex 账号到 alice"，agent 就会自动调用 `codex-switch alice`。
+然后对话里说"切到 alice"，agent 就会自动调用 `codex-switch alice`，**一句话完成完整的双缓存同步**。
+
+### 环境变量
+
+| 变量 | 说明 |
+|---|---|
+| `CODEX_SWITCH_FORCE_RESTART` | 设为 `1` 时强制重启 gateway（默认只在 terminal 交互模式下重启） |
+
+### OpenClaw Agent 名字
+
+默认同步这 5 个 agent 的 auth-profiles：`main chill code luna think`
+
+如果你的 OpenClaw 配置不同，可以直接编辑脚本里的 `OPENCLAW_AGENT_NAMES` 数组（在文件头部）。
 
 ## 常见问题
 

@@ -1,13 +1,26 @@
 #!/usr/bin/env bash
 # codex-switch — ChatGPT Plus 多账号切换工具
 # Usage:
-#   codex-switch              # 显示当前 + 可用账号列表
-#   codex-switch <name>       # 切到指定账号（自动同步当前账号存档）
-#   codex-switch save <name>  # 手动保存当前账号为 <name>
+#   codex-switch                # 显示当前 + 可用账号列表
+#   codex-switch <name>         # 切到指定账号（含 OpenClaw 全链路同步）
+#   codex-switch save <name>    # 手动保存当前账号为 <name>
+#   codex-switch sync-openclaw  # 把当前 auth.json 强制同步到 OpenClaw 的 5 份 auth-profiles.json（debug 用）
+#
+# 2026-04-08 重大升级：修复 OpenClaw 场景下切换失败的 bug
+#   - 之前只改 ~/.codex/auth.json，但 OpenClaw 每个 agent 有独立的
+#     ~/.openclaw/agents/<name>/agent/auth-profiles.json 缓存
+#   - 导致 codex-switch 对 OpenClaw agents 完全无效，所有调用一直烧旧账号的 quota
+#   - 现在 switch 会：同步所有 5 份 profile + 重启 gateway
 
 set -e
 AUTH_DIR="$HOME/.codex"
 AUTH_CURRENT="$AUTH_DIR/auth.json"
+OPENCLAW_AGENTS_DIR="$HOME/.openclaw/agents"
+OPENCLAW_AGENT_NAMES=(main chill code luna think)
+GATEWAY_PLIST="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
+GATEWAY_LABEL="gui/$(id -u)/ai.openclaw.gateway"
+
+# ---------- 工具函数 ----------
 
 # 从 auth.json 读出当前邮箱（解析 id_token JWT）
 current_email() {
@@ -27,7 +40,6 @@ except: pass
 " 2>/dev/null
 }
 
-# 从 auth.json 读出当前邮箱的本地部分（@ 前面）
 current_name() {
     local email=$(current_email)
     [[ -z "$email" ]] && echo "" && return
@@ -77,12 +89,166 @@ auto_sync_current() {
     local cur_name=$(current_name)
     [[ -z "$cur_name" ]] && return
     local archive="$AUTH_DIR/auth-$cur_name.json"
-    # 只在存档已经存在时同步（避免意外创建新存档）
     if [[ -f "$archive" ]]; then
         cp "$AUTH_CURRENT" "$archive"
         echo "  (auto-sync: 当前账号 '$cur_name' 的最新 token 已同步回存档)"
     fi
 }
+
+kill_running_codex() {
+    # 切换前：杀掉所有运行中的 codex 进程，强制下次调用从新 auth.json 重新加载
+    local pids=$(pgrep -x codex 2>/dev/null || true)
+    [[ -z "$pids" ]] && return
+    local count=$(echo $pids | wc -w | tr -d ' ')
+    echo "  (发现 $count 个 codex 进程在运行，停掉以清除 session 内存中的旧 auth)"
+    for pid in $pids; do kill -TERM $pid 2>/dev/null || true; done
+    sleep 1
+    for pid in $pids; do
+        if ps -p $pid > /dev/null 2>&1; then
+            kill -9 $pid 2>/dev/null || true
+            echo "    pid $pid: SIGTERM 没反应，强杀 SIGKILL"
+        fi
+    done
+    echo "  ⚠️  所有 codex 交互 session 已终止，切换后请手动重启 codex"
+}
+
+sync_openclaw_profiles() {
+    # 把 ~/.codex/auth.json 的 access/refresh/expires/accountId 同步到
+    # 所有 OpenClaw agent 的 ~/.openclaw/agents/<name>/agent/auth-profiles.json 里的
+    # profiles.openai-codex:default profile
+    if [[ ! -d "$OPENCLAW_AGENTS_DIR" ]]; then
+        return 0
+    fi
+    if [[ ! -f "$AUTH_CURRENT" ]]; then
+        echo "  [openclaw-sync] 没有 $AUTH_CURRENT，跳过"
+        return 0
+    fi
+
+    python3 << PYEOF
+import json, base64, os, shutil, sys
+from datetime import datetime
+
+AUTH_CURRENT = '$AUTH_CURRENT'
+AGENTS_DIR = '$OPENCLAW_AGENTS_DIR'
+AGENT_NAMES = ['main', 'chill', 'code', 'luna', 'think']
+
+try:
+    src = json.load(open(AUTH_CURRENT))
+except Exception as e:
+    print(f'  [openclaw-sync] 读取 auth.json 失败: {e}')
+    sys.exit(0)
+
+tokens = src.get('tokens', {})
+access = tokens.get('access_token', '')
+refresh = tokens.get('refresh_token', '')
+account_id = tokens.get('account_id', '')
+if not access:
+    print('  [openclaw-sync] auth.json 里没有 access_token，跳过')
+    sys.exit(0)
+
+# 从 JWT 解 exp
+try:
+    p = access.split('.')[1] + '=' * (-len(access.split('.')[1]) % 4)
+    payload = json.loads(base64.urlsafe_b64decode(p))
+    exp_ms = payload['exp'] * 1000
+    sub = payload.get('sub', '?')
+except Exception as e:
+    print(f'  [openclaw-sync] 解 access_token 失败: {e}')
+    sys.exit(0)
+
+# 如果 auth.json 里没有 account_id，尝试从 JWT 拿
+if not account_id:
+    account_id = payload.get('https://api.openai.com/auth', {}).get('chatgpt_account_id', '')
+
+stamp = datetime.now().strftime('%Y-%m-%d-%H%M%S')
+synced = 0
+skipped = 0
+for agent in AGENT_NAMES:
+    path = os.path.join(AGENTS_DIR, agent, 'agent', 'auth-profiles.json')
+    if not os.path.exists(path):
+        skipped += 1
+        continue
+    try:
+        d = json.load(open(path))
+    except Exception as e:
+        print(f'  [openclaw-sync] {agent}: 读失败 ({e})，跳过')
+        skipped += 1
+        continue
+
+    if 'profiles' not in d or 'openai-codex:default' not in d.get('profiles', {}):
+        # 没有 openai-codex profile 的 agent 不动
+        skipped += 1
+        continue
+
+    # 备份旧文件
+    shutil.copy2(path, f'{path}.bak-{stamp}')
+
+    # 改 profile
+    profile = d['profiles']['openai-codex:default']
+    profile['access'] = access
+    profile['refresh'] = refresh
+    profile['expires'] = exp_ms
+    profile['accountId'] = account_id
+
+    # 原子写
+    tmp = f'{path}.tmp-{os.getpid()}'
+    with open(tmp, 'w') as f:
+        json.dump(d, f, indent=4, ensure_ascii=False)
+    os.replace(tmp, path)
+    synced += 1
+
+print(f'  [openclaw-sync] ✓ 已同步 {synced} 个 agent profile (跳过 {skipped} 个)')
+print(f'  [openclaw-sync]   备份后缀: .bak-{stamp}')
+PYEOF
+}
+
+restart_openclaw_gateway() {
+    # 2026-04-08 验证：gateway 会热加载 auth-profiles.json，所以 restart 其实不是必须
+    # 但 terminal 场景保留强制 restart 作为保险（立刻释放内存里的旧 token）
+    # sub-agent 场景直接跳过，因为：
+    #   1. launchctl bootout 需要的权限在 OpenClaw sandbox 下经常失败
+    #   2. bootout 会杀掉 sub-agent 自己（bash 是 gateway 的孙进程）导致输出丢失
+    #   3. gateway 热加载已经够用
+    if [[ ! -f "$GATEWAY_PLIST" ]]; then
+        return 0
+    fi
+    if ! pgrep -x openclaw-gateway > /dev/null 2>&1; then
+        echo "  [gateway] gateway 没在跑，跳过重启"
+        return 0
+    fi
+
+    # 只在交互式 terminal 里做 restart。非交互（sub-agent / pipe / cron）跳过，依赖热加载。
+    if [[ ! -t 1 && "${CODEX_SWITCH_FORCE_RESTART:-}" != "1" ]]; then
+        echo "  [gateway] 非交互式调用（sub-agent / pipe），跳过 restart"
+        echo "  [gateway]   → gateway 会在约 60 秒内热加载新的 auth-profiles.json"
+        echo "  [gateway]   → 如果急着生效，手动跑: launchctl bootout $GATEWAY_LABEL && launchctl bootstrap gui/$(id -u) $GATEWAY_PLIST"
+        return 0
+    fi
+
+    echo "  [gateway] terminal 模式，强制重启 openclaw-gateway（约 10 秒 downtime）..."
+    launchctl bootout "$GATEWAY_LABEL" 2>/dev/null || true
+    sleep 2
+    # 强杀残留（有时 bootout 不够）
+    pgrep -x openclaw-gateway | while read pid; do kill -9 $pid 2>/dev/null || true; done
+    sleep 1
+    if ! launchctl bootstrap gui/$(id -u) "$GATEWAY_PLIST" 2>&1; then
+        # bootstrap 偶发 "Input/output error"，重试一次
+        sleep 2
+        launchctl bootstrap gui/$(id -u) "$GATEWAY_PLIST" 2>&1 || true
+    fi
+    # 等 gateway 起来
+    for i in 1 2 3 4 5 6 7 8; do
+        sleep 1
+        if pgrep -x openclaw-gateway > /dev/null 2>&1; then
+            echo "  [gateway] ✓ gateway 重启完成 (pid $(pgrep -x openclaw-gateway | head -1))"
+            return 0
+        fi
+    done
+    echo "  [gateway] ⚠️  gateway 没回来，手动跑: launchctl bootstrap gui/$(id -u) $GATEWAY_PLIST"
+    return 1
+}
+
+# ---------- 主入口 ----------
 
 case "$1" in
     "")
@@ -101,7 +267,24 @@ case "$1" in
         fi
         cp "$AUTH_CURRENT" "$AUTH_DIR/auth-$2.json"
         echo "✓ 当前账号已保存为 '$2'"
+        # save 也触发 OpenClaw 同步：新登录/新刷新的 token 应该立即让 OpenClaw 看到
+        sync_openclaw_profiles
         show_current
+        ;;
+    sync-openclaw)
+        # debug 用：强制把当前 auth.json 同步到 OpenClaw 5 个 profile
+        if [[ ! -f "$AUTH_CURRENT" ]]; then
+            echo "错误: 没有 auth.json"
+            exit 1
+        fi
+        echo "强制把当前 auth.json ($(current_email)) 同步到 OpenClaw agents..."
+        sync_openclaw_profiles
+        echo ""
+        read -p "要重启 gateway 让新 token 生效吗？[y/N] " -n 1 -r yn
+        echo
+        if [[ $yn =~ ^[Yy]$ ]]; then
+            restart_openclaw_gateway
+        fi
         ;;
     *)
         target="$AUTH_DIR/auth-$1.json"
@@ -111,10 +294,17 @@ case "$1" in
             list_accounts
             exit 1
         fi
-        # 切换前自动同步当前账号的最新 token 回对应存档
+        # 1. 把当前 auth.json 同步回对应的存档（保留 refresh 后的最新 token）
         auto_sync_current
+        # 2. 杀 codex 交互进程（避免内存缓存陷阱）
+        kill_running_codex
+        # 3. 切换 auth.json 到目标账号
         cp "$target" "$AUTH_CURRENT"
         echo "✓ 已切换到账号 '$1'"
+        # 4. 同步新 auth.json 到 OpenClaw 所有 agent 的 auth-profiles.json
+        sync_openclaw_profiles
+        # 5. 重启 gateway 让它重新加载新 auth-profiles（清掉内存里的旧 token）
+        restart_openclaw_gateway
         show_current
         ;;
 esac
