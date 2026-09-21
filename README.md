@@ -1,4 +1,4 @@
-# codex-switch
+# 🧠 AI Agent Skill: codex-switch
 
 > 🧠 **AI Agent Skill** — Let your agent switch ChatGPT Plus accounts for you.
 > Works with [OpenClaw](https://github.com/openclaw/openclaw) · [Claude Code](https://claude.com/claude-code) · [Codex CLI](https://github.com/openai/codex) · and any agent runtime that can shell out.
